@@ -1,0 +1,86 @@
+# Ghost
+The database for agents.
+Create, fork, and discard Postgres databases in seconds. Ghost gives Claude, Cursor, and MCP-powered agents safe, isolated environments without touching production.
+Website: https://ghost.build
+Documentation: https://ghost.build/docs/#introduction
+API Reference: https://ghost.build/docs/#api-reference
+## Installation
+curl -fsSL https://install.ghost.build | sh
+## Quick Start
+ghost login       # Authenticate with GitHub OAuth
+ghost mcp install # Install the MCP server
+ghost create      # Create a new Postgres database
+ghost list        # List all databases
+## Homepage Claims
+- Unlimited databases
+- Unlimited forks
+- 100 hrs/mo free
+- 1TB storage free
+- Hard spending caps
+## Core CLI Commands
+- api-key - Manage API keys
+- completion - Generate the autocompletion script for the specified shell
+- config - List current configuration
+- connect - Get connection string for a database
+- create - Create a new Postgres database
+- delete - Delete a database
+- feedback - Submit feedback, a bug report, or a support request
+- fork - Fork a database
+- help - Help about any command
+- list - List all databases
+- logs - View logs for a database
+- login - Authenticate with GitHub OAuth
+- logout - Remove stored credentials
+- mcp - Ghost Model Context Protocol (MCP) server
+- password - Reset the password for a database
+- pause - Pause a running database
+- psql - Connect to a database using psql
+- rename - Rename a database
+- resume - Resume a paused database
+- schema - Display database schema information
+- sql - Execute SQL query on a database
+- status - Show space usage
+- version - Show version information
+## MCP
+Install: ghost mcp install
+Start: ghost mcp start
+Inspect a capability: ghost mcp get ghost_create
+Available MCP tools:
+- ghost_connect
+- ghost_create
+- ghost_create_dedicated
+- ghost_delete
+- ghost_feedback
+- ghost_fork
+- ghost_fork_dedicated
+- ghost_invoice
+- ghost_invoice_list
+- ghost_list
+- ghost_login
+- ghost_logs
+- ghost_password
+- ghost_pause
+- ghost_rename
+- ghost_resume
+- ghost_schema
+- ghost_sql
+- ghost_status
+- search_docs
+- view_skill
+Available MCP prompts:
+- design-postgis-tables
+- design-postgres-tables
+- find-hypertable-candidates
+- migrate-postgres-tables-to-hypertables
+- pgvector-semantic-search
+- postgres
+- postgres-hybrid-text-search
+- setup-timescaledb-hypertables
+## Canonical Pages
+- Getting started: https://ghost.build/docs/#introduction - Install Ghost, create a database, and start using the CLI.
+- CLI reference: https://ghost.build/docs/#cli-reference - CLI reference for ghost
+- API reference: https://ghost.build/docs/#api-reference - HTTP endpoints for auth, spaces, databases, and API key management.
+- Home: https://ghost.build/ - The database for agents.
+- Learn: https://ghost.build/learn - Get started with Ghost.
+- What's New: https://ghost.build/whatsnew.html - What's New
+- Built with Ghost: https://ghost.build/built-with-ghost.html - Built with Ghost

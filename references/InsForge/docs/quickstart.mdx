@@ -1,0 +1,54 @@
+---
+title: "Quickstart"
+description: "Get InsForge running in 5 minutes"
+---
+
+## Step 1: Create your project
+
+<Card title="Go to InsForge Cloud" icon="cloud" href="https://insforge.dev">
+  Visit [insforge.dev](https://insforge.dev) and create a free account
+</Card>
+
+Once logged in:
+1. Click **"Create New Project"**
+2. Your backend will be ready in ~3 seconds
+3. You'll be redirected to the project console — copy the **Project ID** from the browser URL:
+
+```
+https://insforge.dev/dashboard/project/<your-project-id>
+```
+
+You'll need this Project ID in Step 2.
+
+## Step 2: Install InsForge CLI
+
+In your project directory, run the following command to link your local project to InsForge:
+
+```bash
+npx @insforge/cli link --project-id <your-project-id>
+```
+
+Replace `<your-project-id>` with the Project ID from Step 1. For example:
+
+```bash
+npx @insforge/cli link --project-id 510b4339-7027-45a6-89e9-21a1f03d8bd9
+```
+
+This runs the InsForge CLI via npx (without installing it globally) and links your local directory to your InsForge project.
+
+## Step 3: Verify Installation
+
+Send the following prompt to your AI coding agent to verify the setup:
+
+`I'm using InsForge as my backend platform. Read the current directory, make sure InsForge skills are installed, and use InsForge CLI for backend tasks.`
+
+## Learn More
+
+To explore the full capabilities of the InsForge CLI:
+
+- Check the [npm package documentation](https://www.npmjs.com/package/@insforge/cli)
+- Run the built-in help command:
+
+```bash
+npx @insforge/cli --help
+```

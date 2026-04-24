@@ -1,0 +1,498 @@
+import OpenAI from 'openai';
+import jwt from 'jsonwebtoken';
+import { isCloudEnvironment } from '@/utils/environment.js';
+import { AppError } from '@/api/middlewares/error.js';
+import { ERROR_CODES } from '@/types/error-constants.js';
+import logger from '@/utils/logger.js';
+import { SecretService } from '@/services/secrets/secret.service.js';
+
+interface CloudCredentialsResponse {
+  openrouter?: {
+    api_key: string;
+    limit?: number;
+    expired_at?: string | null;
+    usage?: number;
+    limit_remaining?: number;
+  };
+}
+
+interface CloudCredentials {
+  apiKey: string;
+  limitRemaining?: number;
+}
+
+interface OpenRouterKeyInfo {
+  data: {
+    label: string;
+    usage: number;
+    limit: number | null;
+    is_free_tier: boolean;
+  };
+}
+
+interface OpenRouterLimitation {
+  label: string;
+  credit_limit: number | null;
+  credit_used: number;
+  credit_remaining: number | null;
+  rate_limit?: {
+    requests?: number;
+    interval?: string;
+    note?: string;
+  };
+}
+
+export const BYOK_SECRET_KEY = 'AI_GATEWAY_OPENROUTER_KEY';
+
+export type ApiKeySource = 'byok' | 'cloud' | 'env';
+interface ResolvedApiKey {
+  apiKey: string;
+  source: ApiKeySource;
+}
+
+export class OpenRouterProvider {
+  private static instance: OpenRouterProvider;
+  private cloudCredentials: CloudCredentials | undefined;
+  private openRouterClient: OpenAI | null = null;
+  private currentApiKey: string | undefined;
+  private renewalPromise: Promise<string> | null = null;
+  private fetchPromise: Promise<string> | null = null;
+  private byokKeyCache: string | null | undefined = undefined; // undefined = not yet fetched
+  private byokCacheGeneration = 0;
+
+  private constructor() {}
+
+  static getInstance(): OpenRouterProvider {
+    if (!OpenRouterProvider.instance) {
+      OpenRouterProvider.instance = new OpenRouterProvider();
+    }
+    return OpenRouterProvider.instance;
+  }
+
+  /**
+   * Create or recreate the OpenAI client with the given API key
+   */
+  private createClient(apiKey: string): OpenAI {
+    this.currentApiKey = apiKey;
+    return new OpenAI({
+      baseURL: 'https://openrouter.ai/api/v1',
+      apiKey,
+      defaultHeaders: {
+        'HTTP-Referer': 'https://insforge.dev',
+        'X-Title': 'InsForge',
+      },
+    });
+  }
+
+  /**
+   * Get BYOK API key from secrets store (developer-provided key)
+   * Returns null if no BYOK key is configured
+   */
+  private async getBYOKApiKey(): Promise<string | null> {
+    if (this.byokKeyCache !== undefined) {
+      return this.byokKeyCache;
+    }
+    const generation = this.byokCacheGeneration;
+    try {
+      const secretService = SecretService.getInstance();
+      const key = await secretService.getSecretByKey(BYOK_SECRET_KEY);
+      if (this.byokCacheGeneration === generation) {
+        this.byokKeyCache = key;
+      }
+      return key;
+    } catch (error) {
+      logger.error('Failed to read BYOK secret, cannot determine BYOK state', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Don't cache null on transient errors — next request will retry
+      return null;
+    }
+  }
+
+  /**
+   * Returns true if a BYOK key is currently active (uses in-memory cache).
+   * Use this to skip cloud-specific behaviors like usage tracking.
+   */
+  async isByokActive(): Promise<boolean> {
+    return !!(await this.getBYOKApiKey());
+  }
+
+  /**
+   * Clear cached key and client, forcing re-resolution on next request.
+   * Call this after updating or removing the BYOK key.
+   */
+  clearKeyCache(): void {
+    this.openRouterClient = null;
+    this.currentApiKey = undefined;
+    this.cloudCredentials = undefined;
+    this.byokKeyCache = undefined;
+    this.byokCacheGeneration++;
+  }
+
+  /**
+   * Resolve the API key and its source in one call.
+   * Priority: BYOK > cloud-managed > env variable.
+   * Use this instead of getApiKey() when downstream logic depends on the source.
+   */
+  async getApiKeyWithSource(): Promise<ResolvedApiKey> {
+    // 1. BYOK key (highest priority for both cloud and self-hosted)
+    const byokKey = await this.getBYOKApiKey();
+    if (byokKey) {
+      return { apiKey: byokKey, source: 'byok' };
+    }
+
+    // 2. Cloud environment: fetch from InsForge Cloud
+    if (isCloudEnvironment()) {
+      const apiKey = this.cloudCredentials
+        ? this.cloudCredentials.apiKey
+        : await this.fetchCloudApiKey();
+      return { apiKey, source: 'cloud' };
+    }
+
+    // 3. Self-hosted: env variable fallback
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+      throw new AppError(
+        'OpenRouter API key not configured. Set it via the AI Gateway dashboard or OPENROUTER_API_KEY environment variable.',
+        500,
+        ERROR_CODES.AI_INVALID_API_KEY
+      );
+    }
+    return { apiKey, source: 'env' };
+  }
+
+  /**
+   * Get OpenRouter API key with priority order:
+   * 1. Developer-provided BYOK key (stored in secrets)
+   * 2. InsForge Cloud-managed key (cloud environment only)
+   * 3. OPENROUTER_API_KEY environment variable (self-hosted fallback)
+   */
+  async getApiKey(): Promise<string> {
+    return (await this.getApiKeyWithSource()).apiKey;
+  }
+
+  /**
+   * Get the OpenAI client, creating or updating it as needed.
+   * Accepts a pre-resolved apiKey to avoid a redundant getApiKeyWithSource() call.
+   */
+  private async getClient(resolvedApiKey?: string): Promise<OpenAI> {
+    const apiKey = resolvedApiKey ?? (await this.getApiKey());
+    if (!this.openRouterClient) {
+      this.openRouterClient = this.createClient(apiKey);
+      return this.openRouterClient;
+    }
+    if (isCloudEnvironment() && this.currentApiKey !== apiKey) {
+      this.openRouterClient = this.createClient(apiKey);
+    }
+    return this.openRouterClient;
+  }
+
+  /**
+   * Sync check — returns true if a static key source is configured.
+   * Does NOT check BYOK (async). Use isConfiguredAsync() for a full check.
+   */
+  isConfigured(): boolean {
+    if (isCloudEnvironment()) {
+      return true;
+    }
+    return !!process.env.OPENROUTER_API_KEY;
+  }
+
+  /**
+   * Async check — includes BYOK. Use this wherever an async call is acceptable.
+   */
+  async isConfiguredAsync(): Promise<boolean> {
+    if (this.isConfigured()) {
+      return true;
+    }
+    return this.isByokActive();
+  }
+
+  /**
+   * Get remaining credits for the current API key from OpenRouter
+   */
+  async getRemainingCredits(): Promise<{
+    usage: number;
+    limit: number | null;
+    remaining: number | null;
+  }> {
+    try {
+      const { apiKey, source } = await this.getApiKeyWithSource();
+
+      if (source === 'cloud') {
+        // Use InsForge API for cloud-managed keys only (never forward BYOK secrets)
+        const response = await fetch(
+          `https://api.insforge.dev/ai/v1/limitations?credential=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'GET',
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch key info: ${response.statusText}`);
+        }
+
+        const result = (await response.json()) as { data: OpenRouterLimitation };
+        const keyInfo = result.data;
+
+        return {
+          usage: keyInfo.credit_used,
+          limit: keyInfo.credit_limit,
+          remaining: keyInfo.credit_remaining,
+        };
+      } else {
+        // Use OpenRouter API directly for BYOK and env-var keys
+        const response = await fetch('https://openrouter.ai/api/v1/key', {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new AppError(
+            `Invalid OpenRouter API Key`,
+            500,
+            ERROR_CODES.AI_INVALID_API_KEY,
+            'Check your OpenRouter key and try again.'
+          );
+        }
+
+        const keyInfo = (await response.json()) as OpenRouterKeyInfo;
+
+        return {
+          usage: keyInfo.data.usage,
+          limit: keyInfo.data.limit,
+          remaining: keyInfo.data.limit !== null ? keyInfo.data.limit - keyInfo.data.usage : null,
+        };
+      }
+    } catch (error) {
+      logger.error('Failed to fetch remaining credits', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Fetch API key from cloud service
+   * Uses promise memoization to prevent duplicate fetch requests
+   */
+  private async fetchCloudApiKey(): Promise<string> {
+    // If fetch is already in progress, wait for it
+    if (this.fetchPromise) {
+      logger.info('Fetch already in progress, waiting for completion...');
+      return this.fetchPromise;
+    }
+
+    // Start new fetch and store the promise
+    this.fetchPromise = (async () => {
+      try {
+        const projectId = process.env.PROJECT_ID;
+        if (!projectId) {
+          throw new Error('PROJECT_ID not found in environment variables');
+        }
+
+        const jwtSecret = process.env.JWT_SECRET;
+        if (!jwtSecret) {
+          throw new Error('JWT_SECRET not found in environment variables');
+        }
+
+        // Sign a token for authentication
+        const token = jwt.sign({ projectId }, jwtSecret, { expiresIn: '1h' });
+
+        // Fetch API key from cloud service with sign token as query parameter
+        const response = await fetch(
+          `${process.env.CLOUD_API_HOST || 'https://api.insforge.dev'}/ai/v1/credentials/${projectId}?sign=${token}`
+        );
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch cloud API key: ${response.statusText}`);
+        }
+
+        const data = (await response.json()) as CloudCredentialsResponse;
+
+        // Extract API key from the openrouter object in response
+        if (!data.openrouter?.api_key) {
+          throw new Error('Invalid response: missing openrouter API Key');
+        }
+
+        // Store credentials with metadata
+        this.cloudCredentials = {
+          apiKey: data.openrouter.api_key,
+          limitRemaining: data.openrouter.limit_remaining,
+        };
+
+        logger.info('Successfully fetched cloud API key');
+
+        return data.openrouter.api_key;
+      } catch (error) {
+        logger.error('Failed to fetch cloud API key', {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        });
+        throw error;
+      } finally {
+        // Clear the promise after completion (success or failure)
+        this.fetchPromise = null;
+      }
+    })();
+
+    return this.fetchPromise;
+  }
+
+  /**
+   * Renew API key from cloud service when credits are exhausted
+   * Uses promise memoization to prevent duplicate renewal requests
+   */
+  async renewCloudApiKey(): Promise<string> {
+    // If renewal is already in progress, wait for it
+    if (this.renewalPromise) {
+      logger.info('Renewal already in progress, waiting for completion...');
+      return this.renewalPromise;
+    }
+
+    // Start new renewal and store the promise
+    this.renewalPromise = (async () => {
+      try {
+        const projectId = process.env.PROJECT_ID;
+        if (!projectId) {
+          throw new Error('PROJECT_ID not found in environment variables');
+        }
+
+        const jwtSecret = process.env.JWT_SECRET;
+        if (!jwtSecret) {
+          throw new Error('JWT_SECRET not found in environment variables');
+        }
+
+        // Sign a token for authentication
+        const token = jwt.sign({ projectId }, jwtSecret, { expiresIn: '1h' });
+
+        // Renew API key from cloud service with sign token in request body
+        const response = await fetch(
+          `${process.env.CLOUD_API_HOST || 'https://api.insforge.dev'}/ai/v1/credentials/${projectId}/renew`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ sign: token }),
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(`Failed to renew cloud API key: ${response.statusText}`);
+        }
+
+        const data = (await response.json()) as CloudCredentialsResponse;
+
+        // Extract API key from the openrouter object in response
+        if (!data.openrouter?.api_key) {
+          throw new Error('Invalid response: missing openrouter API Key');
+        }
+
+        // Store credentials with metadata
+        this.cloudCredentials = {
+          apiKey: data.openrouter.api_key,
+          limitRemaining: data.openrouter.limit_remaining,
+        };
+
+        logger.info('Successfully renewed cloud API key');
+
+        // Wait for OpenRouter to propagate the updated credits
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+
+        return data.openrouter.api_key;
+      } catch (error) {
+        logger.error('Failed to renew cloud API key', {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        });
+        throw error;
+      } finally {
+        // Clear the promise after completion (success or failure)
+        this.renewalPromise = null;
+      }
+    })();
+
+    return this.renewalPromise;
+  }
+
+  /**
+   * Send a request to OpenRouter with automatic renewal and retry logic
+   * Handles 403 insufficient credits errors by renewing the API key and retrying
+   * @param request - Function that takes an OpenAI client and returns a Promise
+   * @returns The result of the request
+   */
+  async sendRequest<T>(
+    request: (client: OpenAI) => Promise<T>
+  ): Promise<{ result: T; source: ApiKeySource }> {
+    // Resolve once — thread apiKey into getClient() to avoid a second resolution.
+    const { apiKey, source } = await this.getApiKeyWithSource();
+    const client = await this.getClient(apiKey);
+
+    try {
+      return { result: await request(client), source };
+    } catch (error) {
+      // Only renew cloud-managed keys on 402/403 — never touch BYOK or env keys
+      if (
+        source === 'cloud' &&
+        error instanceof OpenAI.APIError &&
+        (error.status === 402 || error.status === 403)
+      ) {
+        logger.info(`Received ${error.status} insufficient credits, renewing API key...`);
+        const renewedApiKey = await this.renewCloudApiKey();
+
+        // Get fresh client with the renewed key — pass it directly to avoid re-resolution
+        const renewedClient = await this.getClient(renewedApiKey);
+
+        // Retry with exponential backoff (3 attempts)
+        const maxRetries = 3;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          try {
+            const backoffMs = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
+            logger.info(
+              `Retrying request after renewal (attempt ${attempt}/${maxRetries}), waiting ${backoffMs}ms...`
+            );
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+
+            const result = await request(renewedClient);
+            logger.info('Request succeeded after API key renewal');
+            return { result, source };
+          } catch (retryError) {
+            if (attempt === maxRetries) {
+              logger.error(`All ${maxRetries} retry attempts failed after API key renewal`);
+              throw retryError;
+            }
+          }
+        }
+      }
+
+      // Convert upstream API errors to actionable responses
+      if (error instanceof OpenAI.APIError) {
+        if (error.status === 401 || error.status === 403) {
+          throw new AppError(
+            source === 'byok'
+              ? 'Your BYOK API key is invalid or has been revoked. Please update it in Gateway settings.'
+              : 'AI provider authentication failed. Check your API key configuration.',
+            401,
+            ERROR_CODES.AI_INVALID_API_KEY,
+            'Update your API key in the Gateway credentials page.'
+          );
+        }
+        if (error.status === 429) {
+          throw new AppError(
+            'AI provider rate limit exceeded. Please wait before retrying.',
+            429,
+            ERROR_CODES.RATE_LIMITED,
+            'Wait a moment and retry, or check your API key rate limits.'
+          );
+        }
+      }
+
+      throw error;
+    }
+  }
+}
